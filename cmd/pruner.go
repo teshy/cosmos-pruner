@@ -6,8 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/bharvest-devops/cosmos-pruner/internal/rootmulti"
-	"github.com/cockroachdb/pebble"
 	cometdb "github.com/cometbft/cometbft-db"
+	cmtstore "github.com/cometbft/cometbft/proto/tendermint/store"
 	"github.com/cometbft/cometbft/state"
 	"github.com/cometbft/cometbft/store"
 	dbm "github.com/cosmos/cosmos-db"
@@ -253,12 +253,10 @@ func pruneTMData(home string) error {
 		return errDBBlock
 	}
 
-	blockStore := store.NewBlockStore(blockStoreDB)
-	defer blockStore.Close()
-
 	// Get StateStore
 	stateDB, errDBBState := openCometBFTDB("state", home)
 	if errDBBState != nil {
+		blockStoreDB.Close()
 		return errDBBState
 	}
 
@@ -267,9 +265,51 @@ func pruneTMData(home string) error {
 	stateStore := state.NewStore(stateDB, state.StoreOptions{})
 	defer stateStore.Close()
 
-	base := blockStore.Base()
+	// Load committed state BEFORE creating the blockStore wrapper.
+	// The blockstore can sit one block ahead of the committed state at shutdown — the normal
+	// CometBFT transient when the engine stages the next block before committing it. We must
+	// trim any trailing uncommitted blocks BEFORE creating store.NewBlockStore so the wrapper
+	// reads the correct height from disk. If we trim after NewBlockStore, the wrapper's
+	// in-memory height cache (loaded at construction) overwrites our trimmed BlockStoreState
+	// when PruneBlocks() writes its own update — leaving storeHeight > committed again.
+	loadedState, err := stateStore.Load()
+	if err != nil {
+		blockStoreDB.Close()
+		return fmt.Errorf("failed to load state: %w", err)
+	}
 
-	pruneHeight := blockStore.Height() - int64(blocks)
+	// Trim phase: open a temporary blockStore to check and remove any trailing blocks,
+	// then close and reopen the raw DB so the pruning blockStore sees the corrected height.
+	{
+		tempBS := store.NewBlockStore(blockStoreDB)
+		currentHeight := tempBS.Height()
+		if loadedState.LastBlockHeight > 0 && loadedState.LastBlockHeight < currentHeight {
+			fmt.Printf("[pruneTMData] trimming %d trailing uncommitted block(s): %d→%d\n",
+				currentHeight-loadedState.LastBlockHeight, currentHeight, loadedState.LastBlockHeight)
+			if err := trimTrailingBlocks(blockStoreDB, tempBS, loadedState.LastBlockHeight); err != nil {
+				tempBS.Close()
+				blockStoreDB.Close()
+				return fmt.Errorf("failed to trim trailing blocks: %w", err)
+			}
+		}
+		tempBS.Close()
+	}
+
+	// Close and reopen blockStoreDB so the subsequent NewBlockStore reads the (trimmed) height
+	// from disk rather than any stale in-memory state.
+	blockStoreDB.Close()
+	blockStoreDB, errDBBlock = openCometBFTDB("blockstore", home)
+	if errDBBlock != nil {
+		return errDBBlock
+	}
+
+	blockStore := store.NewBlockStore(blockStoreDB)
+	defer blockStore.Close()
+
+	base := blockStore.Base()
+	effectiveHeight := blockStore.Height() // correct after trim
+
+	pruneHeight := effectiveHeight - int64(blocks)
 	fmt.Printf("[pruneTMData] pruneHeight=%d\n", pruneHeight)
 	if pruneHeight <= 0 {
 		fmt.Println("[pruneTMData] No need to prune")
@@ -277,12 +317,11 @@ func pruneTMData(home string) error {
 	}
 
 	if txIdxHeight <= 0 {
-		txIdxHeight = blockStore.Height()
+		txIdxHeight = effectiveHeight
 		fmt.Printf("[pruneTMData] set txIdxHeight=%d\n", txIdxHeight)
 	}
 
 	fmt.Println("pruning block/state store")
-	state, err := stateStore.Load()
 
 	var (
 		prunedBlocksCount uint64
@@ -299,7 +338,7 @@ func pruneTMData(home string) error {
 			height = pruneHeight - 1
 		}
 
-		prunedBlocks, evidenceRetainBlocks, _ := blockStore.PruneBlocks(height, state)
+		prunedBlocks, evidenceRetainBlocks, _ := blockStore.PruneBlocks(height, loadedState)
 		if err != nil {
 			//return err
 			fmt.Println(err.Error())
@@ -371,13 +410,6 @@ func openCosmosDB(dbname string, home string) (dbm.DB, error) {
 		}
 
 		db1 = lvlDB
-	} else if dbType == dbm.PebbleDBBackend {
-		ppDB, err := dbm.NewPebbleDB(dbname, dbDir, dbm.OptionsMap{})
-		if err != nil {
-			return nil, err
-		}
-
-		db1 = ppDB
 	} else {
 		var err error
 		db1, err = dbm.NewDB(dbname, dbType, dbDir)
@@ -407,18 +439,6 @@ func openCometBFTDB(dbname string, home string) (cometdb.DB, error) {
 		}
 
 		db1 = lvlDB
-	} else if dbType == cometdb.PebbleDBBackend {
-		opts := &pebble.Options{
-			//DisableAutomaticCompactions: true, // freeze when pruning!
-		}
-		opts.EnsureDefaults()
-
-		ppDB, err := cometdb.NewPebbleDBWithOpts(dbname, dbDir, opts)
-		if err != nil {
-			return nil, err
-		}
-
-		db1 = ppDB
 	} else {
 		var err error
 		db1, err = cometdb.NewDB(dbname, dbType, dbDir)
@@ -435,31 +455,11 @@ func compactCosmosDB(vdb dbm.DB) error {
 
 	if dbType == dbm.GoLevelDBBackend {
 		vdbLevel := vdb.(*dbm.GoLevelDB)
-
 		if err := vdbLevel.ForceCompact(nil, nil); err != nil {
 			return err
 		}
 	} else if dbType == dbm.PebbleDBBackend {
-		vdbPebble := vdb.(*dbm.PebbleDB).DB()
-
-		iter, _ := vdbPebble.NewIter(nil)
-		//defer iter.Close()
-
-		var start, end []byte
-
-		if iter.First() {
-			start = cp(iter.Key())
-		}
-
-		if iter.Last() {
-			end = cp(iter.Key())
-		}
-
-		// close iter before compacting
-		iter.Close()
-
-		err := vdbPebble.Compact(start, end, false)
-		if err != nil {
+		if err := compactCosmosDBPebble(vdb); err != nil {
 			return err
 		}
 	}
@@ -472,31 +472,11 @@ func compactCometBFTDB(vdb cometdb.DB) error {
 
 	if dbType == cometdb.GoLevelDBBackend {
 		vdbLevel := vdb.(*cometdb.GoLevelDB)
-
 		if err := vdbLevel.Compact(nil, nil); err != nil {
 			return err
 		}
 	} else if dbType == cometdb.PebbleDBBackend {
-		vdbPebble := vdb.(*cometdb.PebbleDB).DB()
-
-		iter, _ := vdbPebble.NewIter(nil)
-		//defer iter.Close()
-
-		var start, end []byte
-
-		if iter.First() {
-			start = cp(iter.Key())
-		}
-
-		if iter.Last() {
-			end = cp(iter.Key())
-		}
-
-		// close iter before compacting
-		iter.Close()
-
-		err := vdbPebble.Compact(start, end, false)
-		if err != nil {
+		if err := compactCometBFTDBPebble(vdb); err != nil {
 			return err
 		}
 	}
@@ -552,4 +532,65 @@ func rootify(path, root string) string {
 func int64FromBytes(bz []byte) int64 {
 	v, _ := binary.Varint(bz)
 	return v
+}
+
+// trimTrailingBlocks deletes any block data above committedHeight from the blockstore and writes
+// a fresh BlockStoreState so blockStore.Height() == committedHeight on next open.
+//
+// Why this is needed: the blockstore can sit one block ahead of the committed app/state height at
+// shutdown — CometBFT stages the next block before the previous one is fully committed. If
+// cosmos-pruner runs against data in that transient state, PruneBlocks() only removes old blocks
+// from the bottom and leaves the uncommitted trailing block at the top. On restart the node sees
+// storeHeight > appHeight, attempts to replay the trailing block, and chains whose BeginBlocker
+// validates against pruned state (e.g. validator set records) panic. Chains that do not panic
+// are still left with store > state — a latent inconsistency.
+//
+// This function explicitly removes the trailing block keys (H:, P:*, SC:, BH:) and rewrites the
+// BlockStoreState meta so the store reports exactly the committed height.
+func trimTrailingBlocks(db cometdb.DB, bs *store.BlockStore, committedHeight int64) error {
+	for h := bs.Height(); h > committedHeight; h-- {
+		batch := db.NewBatch()
+
+		// Delete block header
+		batch.Delete([]byte(fmt.Sprintf("H:%d", h)))
+		// Delete seenCommit
+		batch.Delete([]byte(fmt.Sprintf("SC:%d", h)))
+		// Delete extended commit (vote extensions, ABCI 2.0 / CometBFT 0.38+). Mirrors
+		// CometBFT's own PruneBlocks, which deletes EC:<h> for every pruned height; without
+		// this, trimming a block that had SaveBlockWithExtendedCommit called on it leaves an
+		// orphaned EC:<h> key behind.
+		batch.Delete([]byte(fmt.Sprintf("EC:%d", h)))
+
+		// Delete block parts and BH:<hash> using the block meta if available.
+		// For a staged-but-uncommitted block the meta may or may not be present.
+		if meta := bs.LoadBlockMeta(h); meta != nil {
+			for i := 0; i < int(meta.BlockID.PartSetHeader.Total); i++ {
+				batch.Delete([]byte(fmt.Sprintf("P:%d:%d", h, i)))
+			}
+			hash := strings.ToLower(meta.BlockID.Hash.String())
+			batch.Delete([]byte(fmt.Sprintf("BH:%s", hash)))
+		} else {
+			// Meta absent — delete at least the most common single-part key
+			batch.Delete([]byte(fmt.Sprintf("P:%d:0", h)))
+		}
+
+		// Rewrite BlockStoreState so Height reflects the trimmed top.
+		// Do this on every iteration so the state is consistent even if we crash mid-trim.
+		newHeight := h - 1
+		bss := cmtstore.BlockStoreState{Base: bs.Base(), Height: newHeight}
+		bssBytes, err := bss.Marshal()
+		if err != nil {
+			batch.Close()
+			return fmt.Errorf("marshal BlockStoreState: %w", err)
+		}
+		batch.Set([]byte("blockStore"), bssBytes)
+
+		if err := batch.WriteSync(); err != nil {
+			batch.Close()
+			return fmt.Errorf("write trim batch at height %d: %w", h, err)
+		}
+		batch.Close()
+		fmt.Printf("[trimTrailingBlocks] removed block %d, blockstore now at %d\n", h, newHeight)
+	}
+	return nil
 }
