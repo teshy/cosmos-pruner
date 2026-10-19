@@ -186,6 +186,9 @@ func pruneAppState(home string) error {
 
 	// TODO: cleanup app state
 	appStore := rootmulti.NewStore(appDB, log.NewNopLogger())
+	// store v1.1.2 loads IAVL with async pruning by default (iavl/store.go:55); this tool
+	// exits right after PruneStores, so prune synchronously.
+	appStore.SetIAVLSyncPruning(true)
 
 	if txIdxHeight <= 0 {
 		txIdxHeight = appStore.LastCommitID().Version
