@@ -62,6 +62,7 @@ type Store struct {
 	pruningManager      *pruning.Manager
 	iavlCacheSize       int
 	iavlDisableFastNode bool
+	iavlSyncPruning     bool
 	storesParams        map[types.StoreKey]storeParams
 	stores              map[types.StoreKey]types.CommitKVStore
 	keysByName          map[string]types.StoreKey
@@ -137,6 +138,13 @@ func (rs *Store) SetIAVLCacheSize(cacheSize int) {
 
 func (rs *Store) SetIAVLDisableFastNode(disableFastNode bool) {
 	rs.iavlDisableFastNode = disableFastNode
+}
+
+// SetIAVLSyncPruning selects sync (true) or async (false, the store default) IAVL pruning.
+// An offline tool must use sync: async pruning runs in a background goroutine and can be
+// cut short when the process closes the DB.
+func (rs *Store) SetIAVLSyncPruning(syncPruning bool) {
+	rs.iavlSyncPruning = syncPruning
 }
 
 // GetStoreType implements Store.
@@ -1043,15 +1051,7 @@ func (rs *Store) loadCommitStoreFromParams(key types.StoreKey, id types.CommitID
 		panic("recursive MultiStores not yet supported")
 
 	case types.StoreTypeIAVL:
-		var store types.CommitKVStore
-		var err error
-
-		if params.initialVersion == 0 {
-			store, err = iavl.LoadStore(db, rs.logger, key, id, rs.iavlCacheSize, rs.iavlDisableFastNode, rs.metrics)
-		} else {
-			store, err = iavl.LoadStoreWithInitialVersion(db, rs.logger, key, id, params.initialVersion, rs.iavlCacheSize, rs.iavlDisableFastNode, rs.metrics)
-		}
-
+		store, err := iavl.LoadStoreWithOpts(db, rs.logger, key, id, params.initialVersion, rs.iavlCacheSize, rs.iavlDisableFastNode, rs.metrics, iavltree.AsyncPruningOption(!rs.iavlSyncPruning))
 		if err != nil {
 			return nil, err
 		}
